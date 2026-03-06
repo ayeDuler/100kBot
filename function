@@ -1,0 +1,816 @@
+import asyncio
+import json
+import os
+import time
+from collections import defaultdict, deque
+
+import requests
+import websockets
+
+WS_URL = "wss://pumpportal.fun/api/data"
+STATE_FILE = "pumpfun_wallet_history.json"
+
+# =========================
+# CONFIG
+# =========================
+PUMPPORTAL_API_KEY = os.getenv("PUMPPORTAL_API_KEY", "")
+
+# Safety: keep OFF until you intentionally enable it
+LIVE_TRADING_ENABLED = False
+
+# Trading / risk
+BUY_AMOUNT_SOL = 0.02
+MAX_OPEN_POSITIONS = 3
+MAX_POSITION_PER_TOKEN_SOL = 0.03
+SLIPPAGE_BPS_PERCENT = 12
+PRIORITY_FEE_SOL = 0.00005
+POOL = "auto"
+
+# Entry controls
+MIN_SCORE_TO_ALERT = 70
+MIN_SCORE_TO_BUY = 88
+MIN_ALERT_AGE_SECONDS = 10
+TRACK_SECONDS = 90
+REBUY_COOLDOWN_SECONDS = 1800
+
+# Position management
+STOP_LOSS_PCT = 0.18          # sell if est. price falls 18% from entry
+TAKE_PROFIT_PCT = 0.35        # partial/full take profit trigger
+TRAILING_STOP_PCT = 0.12      # after token moves up, trail 12% off peak
+FORCE_EXIT_SELL_PRESSURE = True
+
+# Scanner thresholds
+MIN_UNIQUE_BUYERS = 8
+MIN_BUY_COUNT = 12
+TOKEN_FINALIZE_AGE_SECONDS = 180
+TOKEN_CLEANUP_AGE_SECONDS = 600
+MAX_SINGLE_WALLET_SHARE_HEALTHY = 0.28
+
+SMART_WALLETS = {
+    # "wallet_here"
+}
+
+# =========================
+# RUNTIME STATE
+# =========================
+tokens = {}
+alerts_sent = set()
+open_positions = {}
+last_trade_time = {}
+
+wallet_history = defaultdict(
+    lambda: {
+        "launches": 0,
+        "rug_flags": 0,
+        "instant_dump_flags": 0,
+        "creator_dump_flags": 0,
+        "dominant_wallet_flags": 0,
+        "last_seen": 0.0,
+    }
+)
+
+# =========================
+# UTILS
+# =========================
+def now_ts() -> float:
+    return time.time()
+
+
+def load_wallet_history():
+    global wallet_history
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        loaded = defaultdict(
+            lambda: {
+                "launches": 0,
+                "rug_flags": 0,
+                "instant_dump_flags": 0,
+                "creator_dump_flags": 0,
+                "dominant_wallet_flags": 0,
+                "last_seen": 0.0,
+            }
+        )
+        for wallet, stats in raw.items():
+            loaded[wallet].update(stats)
+        wallet_history = loaded
+        print(f"Loaded wallet history for {len(wallet_history)} wallets")
+    except Exception as e:
+        print("Failed to load wallet history:", e)
+
+
+def save_wallet_history():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(dict(wallet_history), f, indent=2)
+    except Exception as e:
+        print("Failed to save wallet history:", e)
+
+
+def extract_token_key(event: dict) -> str | None:
+    for key in ("mint", "tokenAddress", "ca", "address"):
+        if event.get(key):
+            return str(event[key])
+    return None
+
+
+def extract_wallet_key(event: dict) -> str | None:
+    for key in ("traderPublicKey", "user", "wallet", "owner"):
+        if event.get(key):
+            return str(event[key])
+    return None
+
+
+def extract_side(event: dict) -> str:
+    side = str(event.get("txType", event.get("side", ""))).lower()
+    if "buy" in side:
+        return "buy"
+    if "sell" in side:
+        return "sell"
+    return "unknown"
+
+
+def extract_amount(event: dict) -> float:
+    for key in ("solAmount", "amountSol", "amount", "volume"):
+        try:
+            if event.get(key) is not None:
+                return float(event[key])
+        except Exception:
+            pass
+    return 0.0
+
+
+def new_token_state(event: dict) -> dict:
+    creator = (
+        event.get("creator")
+        or event.get("creatorWallet")
+        or event.get("dev")
+        or event.get("deployWallet")
+    )
+
+    return {
+        "created_at": now_ts(),
+        "meta": event,
+        "creator_wallet": creator,
+        "buyers": set(),
+        "sellers": set(),
+        "buy_count": 0,
+        "sell_count": 0,
+        "buy_volume": 0.0,
+        "sell_volume": 0.0,
+        "wallet_buys": defaultdict(float),
+        "wallet_sells": defaultdict(float),
+        "recent_trades": deque(maxlen=300),
+        "smart_wallet_hits": set(),
+        "migration_seen": False,
+        "first_buy_ts": None,
+        "first_sell_ts": None,
+        "finalized": False,
+        "last_est_price": None,
+    }
+
+
+# =========================
+# RISK HELPERS
+# =========================
+def get_biggest_buyer_share(state: dict) -> float:
+    if state["buy_volume"] <= 0 or not state["wallet_buys"]:
+        return 0.0
+    biggest_wallet_buy = max(state["wallet_buys"].values())
+    return biggest_wallet_buy / max(state["buy_volume"], 1e-9)
+
+
+def get_top_n_buyer_share(state: dict, n: int = 3) -> float:
+    if state["buy_volume"] <= 0 or not state["wallet_buys"]:
+        return 0.0
+    buys = sorted(state["wallet_buys"].values(), reverse=True)
+    return sum(buys[:n]) / max(state["buy_volume"], 1e-9)
+
+
+def creator_sell_ratio(state: dict) -> float:
+    creator = state.get("creator_wallet")
+    if not creator:
+        return 0.0
+    creator_buys = state["wallet_buys"].get(creator, 0.0)
+    creator_sells = state["wallet_sells"].get(creator, 0.0)
+    if creator_buys <= 0:
+        return 0.0
+    return creator_sells / max(creator_buys, 1e-9)
+
+
+def is_instant_dump(state: dict) -> bool:
+    first_buy_ts = state.get("first_buy_ts")
+    first_sell_ts = state.get("first_sell_ts")
+
+    if first_buy_ts is None or first_sell_ts is None:
+        return False
+
+    sell_delay = first_sell_ts - first_buy_ts
+    age = now_ts() - state["created_at"]
+
+    very_fast_first_sell = sell_delay <= 15
+    early_heavy_sells = age <= 60 and state["sell_volume"] >= state["buy_volume"] * 0.85
+    weak_buyer_support = (
+        len(state["buyers"]) > 0 and len(state["sellers"]) >= len(state["buyers"]) * 0.7
+    )
+
+    return very_fast_first_sell and early_heavy_sells and weak_buyer_support
+
+
+def dominant_wallets(state: dict, n: int = 3) -> list[str]:
+    ranked = sorted(state["wallet_buys"].items(), key=lambda x: x[1], reverse=True)
+    return [wallet for wallet, _ in ranked[:n]]
+
+
+def wallet_history_penalty(state: dict) -> tuple[int, list[str]]:
+    score_penalty = 0
+    reasons = []
+    wallets_to_check = set()
+
+    creator = state.get("creator_wallet")
+    if creator:
+        wallets_to_check.add(creator)
+
+    for wallet in dominant_wallets(state, n=3):
+        wallets_to_check.add(wallet)
+
+    for wallet in wallets_to_check:
+        stats = wallet_history.get(wallet)
+        if not stats:
+            continue
+
+        launches = stats.get("launches", 0)
+        rug_flags = stats.get("rug_flags", 0)
+        instant_dump_flags = stats.get("instant_dump_flags", 0)
+        creator_dump_flags = stats.get("creator_dump_flags", 0)
+        dominant_wallet_flags = stats.get("dominant_wallet_flags", 0)
+
+        if wallet == creator:
+            if rug_flags >= 3:
+                score_penalty -= 30
+                reasons.append("creator wallet tied to multiple rug-like launches")
+            elif rug_flags >= 2:
+                score_penalty -= 18
+                reasons.append("creator wallet has repeated rug-risk history")
+
+            if creator_dump_flags >= 2:
+                score_penalty -= 15
+                reasons.append("creator wallet repeatedly dumped early")
+
+        if dominant_wallet_flags >= 3:
+            score_penalty -= 18
+            reasons.append("top wallet linked to repeated dumpy launches")
+        elif dominant_wallet_flags >= 2:
+            score_penalty -= 10
+            reasons.append("top wallet has suspicious repeat history")
+
+        if launches >= 3 and instant_dump_flags >= 2:
+            score_penalty -= 10
+            reasons.append("repeat instant-dump pattern in wallet history")
+
+    return score_penalty, reasons
+
+
+def hard_rug_filter(state: dict) -> bool:
+    biggest_share = get_biggest_buyer_share(state)
+    top3_share = get_top_n_buyer_share(state, n=3)
+    creator_ratio = creator_sell_ratio(state)
+
+    if biggest_share >= 0.70:
+        return True
+    if top3_share >= 0.85:
+        return True
+    if is_instant_dump(state):
+        return True
+    if creator_ratio >= 0.90:
+        return True
+
+    creator = state.get("creator_wallet")
+    if creator:
+        stats = wallet_history.get(creator, {})
+        if stats.get("rug_flags", 0) >= 4:
+            return True
+
+    return False
+
+
+# =========================
+# SCORING
+# =========================
+def score_token(token_key: str, state: dict) -> tuple[int, list[str]]:
+    reasons = []
+    score = 0
+
+    age = now_ts() - state["created_at"]
+    unique_buyers = len(state["buyers"])
+    unique_sellers = len(state["sellers"])
+    buy_count = state["buy_count"]
+    sell_count = state["sell_count"]
+    buy_volume = state["buy_volume"]
+    sell_volume = state["sell_volume"]
+
+    if unique_buyers >= MIN_UNIQUE_BUYERS:
+        score += 20
+        reasons.append(f"{unique_buyers} unique early buyers")
+
+    if buy_count >= MIN_BUY_COUNT:
+        score += 20
+        reasons.append(f"{buy_count} early buys")
+
+    if buy_volume > sell_volume * 1.8 and buy_volume > 0:
+        score += 20
+        reasons.append("strong buy pressure")
+
+    if state["smart_wallet_hits"]:
+        bonus = min(15, 5 * len(state["smart_wallet_hits"]))
+        score += bonus
+        reasons.append(f"smart-wallet activity: {len(state['smart_wallet_hits'])}")
+
+    biggest_share = get_biggest_buyer_share(state)
+    top3_share = get_top_n_buyer_share(state, n=3)
+
+    if biggest_share < MAX_SINGLE_WALLET_SHARE_HEALTHY:
+        score += 15
+        reasons.append("holder concentration looks healthier")
+    elif biggest_share >= 0.60:
+        score -= 40
+        reasons.append(f"rug-risk: one wallet controls {biggest_share:.0%} of early buys")
+    elif biggest_share >= 0.45:
+        score -= 25
+        reasons.append(f"rug-risk: very high single-wallet concentration ({biggest_share:.0%})")
+    elif biggest_share >= 0.35:
+        score -= 12
+        reasons.append(f"concentration warning: one wallet at {biggest_share:.0%}")
+
+    if top3_share >= 0.80:
+        score -= 30
+        reasons.append(f"rug-risk: top 3 wallets control {top3_share:.0%} of early buys")
+    elif top3_share >= 0.65:
+        score -= 15
+        reasons.append(f"top 3 wallets highly concentrated ({top3_share:.0%})")
+
+    if is_instant_dump(state):
+        score -= 35
+        reasons.append("rug-risk: instant dump behavior detected")
+
+    creator_ratio = creator_sell_ratio(state)
+    if creator_ratio >= 0.80:
+        score -= 40
+        reasons.append("rug-risk: creator dumped most of position early")
+    elif creator_ratio >= 0.40:
+        score -= 20
+        reasons.append("creator sold a large share early")
+
+    if unique_sellers > unique_buyers and sell_count > buy_count * 0.8:
+        score -= 20
+        reasons.append("early selling pressure")
+
+    if age > TRACK_SECONDS and buy_count < MIN_BUY_COUNT:
+        score -= 15
+        reasons.append("weak first-minute momentum")
+
+    hist_penalty, hist_reasons = wallet_history_penalty(state)
+    score += hist_penalty
+    reasons.extend(hist_reasons)
+
+    return score, reasons
+
+
+def should_alert(token_key: str, state: dict) -> tuple[bool, int, list[str]]:
+    score, reasons = score_token(token_key, state)
+    age = now_ts() - state["created_at"]
+
+    if token_key in alerts_sent:
+        return False, score, reasons
+
+    if age < MIN_ALERT_AGE_SECONDS:
+        return False, score, reasons
+
+    if hard_rug_filter(state):
+        reasons.append("hard-filtered for rug risk")
+        return False, score, reasons
+
+    return score >= MIN_SCORE_TO_ALERT, score, reasons
+
+
+def is_trusted_project(token_key: str, state: dict, score: int) -> tuple[bool, list[str]]:
+    notes = []
+
+    if hard_rug_filter(state):
+        notes.append("failed hard rug filter")
+        return False, notes
+
+    if score < MIN_SCORE_TO_BUY:
+        notes.append(f"score {score} below buy threshold {MIN_SCORE_TO_BUY}")
+        return False, notes
+
+    if len(open_positions) >= MAX_OPEN_POSITIONS:
+        notes.append("max open positions reached")
+        return False, notes
+
+    last = last_trade_time.get(token_key)
+    if last and (now_ts() - last) < REBUY_COOLDOWN_SECONDS:
+        notes.append("token still on rebuy cooldown")
+        return False, notes
+
+    biggest = get_biggest_buyer_share(state)
+    top3 = get_top_n_buyer_share(state, 3)
+    creator_ratio = creator_sell_ratio(state)
+
+    if biggest >= 0.45:
+        notes.append("single-wallet concentration too high for auto-buy")
+        return False, notes
+    if top3 >= 0.70:
+        notes.append("top-3 concentration too high for auto-buy")
+        return False, notes
+    if creator_ratio > 0.20:
+        notes.append("creator already selling too early")
+        return False, notes
+
+    if state["buy_volume"] <= state["sell_volume"] * 1.5:
+        notes.append("buy pressure not strong enough")
+        return False, notes
+
+    if len(state["buyers"]) < 10:
+        notes.append("not enough unique buyers")
+        return False, notes
+
+    notes.append("passed trusted-project gate")
+    return True, notes
+
+
+# =========================
+# PRICE / POSITION HELPERS
+# =========================
+def estimate_price(state: dict) -> float | None:
+    """
+    Very rough proxy price using aggregate flow.
+    Replace this with a true quote if you add a proper quote endpoint later.
+    """
+    if state["buy_count"] + state["sell_count"] < 4:
+        return None
+
+    net_flow = max(state["buy_volume"] - state["sell_volume"], 0.0000001)
+    breadth = max(len(state["buyers"]), 1)
+    est = net_flow / breadth
+    state["last_est_price"] = est
+    return est
+
+
+def mark_position_peak(token_key: str, current_price: float):
+    pos = open_positions.get(token_key)
+    if not pos:
+        return
+    pos["peak_price"] = max(pos["peak_price"], current_price)
+
+
+def open_position_record(token_key: str, state: dict, entry_price: float, buy_sol: float, tx_sig: str):
+    open_positions[token_key] = {
+        "mint": token_key,
+        "name": state["meta"].get("name", "Unknown"),
+        "symbol": state["meta"].get("symbol", "???"),
+        "entry_price": entry_price,
+        "peak_price": entry_price,
+        "buy_sol": buy_sol,
+        "opened_at": now_ts(),
+        "tx_buy": tx_sig,
+    }
+    last_trade_time[token_key] = now_ts()
+
+
+def close_position_record(token_key: str):
+    if token_key in open_positions:
+        del open_positions[token_key]
+    last_trade_time[token_key] = now_ts()
+
+
+# =========================
+# TRADE EXECUTION
+# =========================
+def trade_via_lightning(action: str, mint: str, amount, denominated_in_sol: bool) -> dict:
+    if not PUMPPORTAL_API_KEY:
+        return {"ok": False, "error": "Missing PUMPPORTAL_API_KEY"}
+
+    url = f"https://pumpportal.fun/api/trade?api-key={PUMPPORTAL_API_KEY}"
+    payload = {
+        "action": action,
+        "mint": mint,
+        "amount": amount,
+        "denominatedInSol": "true" if denominated_in_sol else "false",
+        "slippage": SLIPPAGE_BPS_PERCENT,
+        "priorityFee": PRIORITY_FEE_SOL,
+        "pool": POOL,
+        "skipPreflight": "false",
+        "jitoOnly": "false",
+    }
+
+    try:
+        r = requests.post(url, json=payload, timeout=20)
+        data = r.json()
+        if r.ok:
+            return {"ok": True, "data": data}
+        return {"ok": False, "error": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def maybe_buy_token(token_key: str, state: dict, score: int, reasons: list[str]):
+    if token_key in open_positions:
+        return
+
+    trusted, notes = is_trusted_project(token_key, state, score)
+    if not trusted:
+        return
+
+    entry_price = estimate_price(state)
+    if entry_price is None:
+        return
+
+    buy_sol = min(BUY_AMOUNT_SOL, MAX_POSITION_PER_TOKEN_SOL)
+
+    print(f"[BUY-CANDIDATE] {token_key} | score={score} | notes={notes}")
+
+    if not LIVE_TRADING_ENABLED:
+        print("[PAPER] buy skipped because LIVE_TRADING_ENABLED=False")
+        return
+
+    result = trade_via_lightning(
+        action="buy",
+        mint=token_key,
+        amount=buy_sol,
+        denominated_in_sol=True,
+    )
+
+    if result["ok"]:
+        tx = str(result["data"])
+        print(f"[LIVE BUY] {token_key} success: {tx}")
+        open_position_record(token_key, state, entry_price, buy_sol, tx)
+    else:
+        print(f"[LIVE BUY ERROR] {token_key}: {result['error']}")
+
+
+async def maybe_manage_position(token_key: str, state: dict):
+    pos = open_positions.get(token_key)
+    if not pos:
+        return
+
+    current_price = estimate_price(state)
+    if current_price is None:
+        return
+
+    mark_position_peak(token_key, current_price)
+
+    entry = pos["entry_price"]
+    peak = pos["peak_price"]
+
+    if entry <= 0:
+        return
+
+    pnl_pct = (current_price - entry) / entry
+    drawdown_from_peak = (peak - current_price) / peak if peak > 0 else 0.0
+
+    sell_reason = None
+    sell_amount = "100%"
+
+    if pnl_pct <= -STOP_LOSS_PCT:
+        sell_reason = f"stop loss hit ({pnl_pct:.1%})"
+
+    elif pnl_pct >= TAKE_PROFIT_PCT:
+        sell_reason = f"take profit hit ({pnl_pct:.1%})"
+
+    elif peak > entry * 1.12 and drawdown_from_peak >= TRAILING_STOP_PCT:
+        sell_reason = f"trailing stop hit ({drawdown_from_peak:.1%} off peak)"
+
+    elif FORCE_EXIT_SELL_PRESSURE:
+        if state["sell_volume"] > state["buy_volume"] * 1.05 and len(state["sellers"]) >= len(state["buyers"]):
+            sell_reason = "sell pressure reversal"
+
+    if not sell_reason:
+        return
+
+    print(f"[SELL-CANDIDATE] {token_key} | reason={sell_reason}")
+
+    if not LIVE_TRADING_ENABLED:
+        print("[PAPER] sell skipped because LIVE_TRADING_ENABLED=False")
+        close_position_record(token_key)
+        return
+
+    result = trade_via_lightning(
+        action="sell",
+        mint=token_key,
+        amount=sell_amount,
+        denominated_in_sol=False,
+    )
+
+    if result["ok"]:
+        tx = str(result["data"])
+        print(f"[LIVE SELL] {token_key} success: {tx}")
+        close_position_record(token_key)
+    else:
+        print(f"[LIVE SELL ERROR] {token_key}: {result['error']}")
+
+
+# =========================
+# HISTORY ROLLUP
+# =========================
+def update_wallet_history_for_token(state: dict):
+    creator = state.get("creator_wallet")
+    biggest_share = get_biggest_buyer_share(state)
+    top3_share = get_top_n_buyer_share(state, 3)
+    top3 = dominant_wallets(state, n=3)
+    creator_ratio = creator_sell_ratio(state)
+    instant_dump = is_instant_dump(state)
+
+    rug_like = (
+        biggest_share >= 0.60
+        or top3_share >= 0.80
+        or instant_dump
+        or creator_ratio >= 0.80
+    )
+
+    if creator:
+        wallet_history[creator]["launches"] += 1
+        wallet_history[creator]["last_seen"] = now_ts()
+        if rug_like:
+            wallet_history[creator]["rug_flags"] += 1
+        if instant_dump:
+            wallet_history[creator]["instant_dump_flags"] += 1
+        if creator_ratio >= 0.40:
+            wallet_history[creator]["creator_dump_flags"] += 1
+
+    for wallet in top3:
+        wallet_history[wallet]["last_seen"] = now_ts()
+        if rug_like:
+            wallet_history[wallet]["dominant_wallet_flags"] += 1
+        if instant_dump:
+            wallet_history[wallet]["instant_dump_flags"] += 1
+
+
+def maybe_finalize_token(token_key: str, state: dict):
+    if state.get("finalized"):
+        return
+    if now_ts() - state["created_at"] >= TOKEN_FINALIZE_AGE_SECONDS:
+        update_wallet_history_for_token(state)
+        state["finalized"] = True
+
+
+# =========================
+# EVENT PROCESSING
+# =========================
+async def process_new_token(ws, event: dict):
+    token_key = extract_token_key(event)
+    if not token_key:
+        return
+
+    if token_key not in tokens:
+        tokens[token_key] = new_token_state(event)
+        await ws.send(json.dumps({
+            "method": "subscribeTokenTrade",
+            "keys": [token_key],
+        }))
+
+
+async def process_trade(event: dict):
+    token_key = extract_token_key(event)
+    wallet = extract_wallet_key(event)
+    side = extract_side(event)
+    amount = extract_amount(event)
+
+    if not token_key:
+        return
+
+    if token_key not in tokens:
+        tokens[token_key] = new_token_state({"mint": token_key})
+
+    state = tokens[token_key]
+    state["recent_trades"].append(event)
+
+    if wallet in SMART_WALLETS:
+        state["smart_wallet_hits"].add(wallet)
+
+    ts = now_ts()
+
+    if side == "buy":
+        state["buy_count"] += 1
+        state["buy_volume"] += amount
+        if state["first_buy_ts"] is None:
+            state["first_buy_ts"] = ts
+        if wallet:
+            state["buyers"].add(wallet)
+            state["wallet_buys"][wallet] += amount
+
+    elif side == "sell":
+        state["sell_count"] += 1
+        state["sell_volume"] += amount
+        if state["first_sell_ts"] is None:
+            state["first_sell_ts"] = ts
+        if wallet:
+            state["sellers"].add(wallet)
+            state["wallet_sells"][wallet] += amount
+
+
+async def process_migration(event: dict):
+    token_key = extract_token_key(event)
+    if token_key and token_key in tokens:
+        tokens[token_key]["migration_seen"] = True
+
+
+# =========================
+# ALERTING / LOOP
+# =========================
+async def send_alert(token_key: str, state: dict, score: int, reasons: list[str]):
+    meta = state["meta"]
+    name = meta.get("name", "Unknown")
+    symbol = meta.get("symbol", "???")
+
+    print("\n" + "=" * 90)
+    print(f"ALERT: {name} ({symbol})")
+    print(f"Token: {token_key}")
+    print(f"Score: {score}")
+    print("Reasons:", ", ".join(reasons))
+    print(f"Buys: {state['buy_count']} | Sells: {state['sell_count']}")
+    print(f"Unique buyers: {len(state['buyers'])}")
+    print(f"Buy volume: {state['buy_volume']:.4f} SOL")
+    print(f"Sell volume: {state['sell_volume']:.4f} SOL")
+    print(f"Biggest wallet share: {get_biggest_buyer_share(state):.0%}")
+    print(f"Top 3 wallet share: {get_top_n_buyer_share(state, 3):.0%}")
+    print("=" * 90 + "\n")
+
+    alerts_sent.add(token_key)
+
+
+async def alert_loop():
+    while True:
+        try:
+            for token_key, state in list(tokens.items()):
+                maybe_finalize_token(token_key, state)
+
+                fire, score, reasons = should_alert(token_key, state)
+                if fire:
+                    await send_alert(token_key, state, score, reasons)
+                    await maybe_buy_token(token_key, state, score, reasons)
+
+                await maybe_manage_position(token_key, state)
+
+                if now_ts() - state["created_at"] > TOKEN_CLEANUP_AGE_SECONDS:
+                    maybe_finalize_token(token_key, state)
+                    tokens.pop(token_key, None)
+
+            save_wallet_history()
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            print("alert_loop error:", e)
+            await asyncio.sleep(2)
+
+
+# =========================
+# MAIN
+# =========================
+async def main():
+    load_wallet_history()
+
+    async with websockets.connect(
+        WS_URL,
+        ping_interval=20,
+        ping_timeout=20,
+    ) as ws:
+        await ws.send(json.dumps({"method": "subscribeNewToken"}))
+        await ws.send(json.dumps({"method": "subscribeMigration"}))
+
+        print("Connected. Watching new pump.fun launches...")
+
+        alert_task = asyncio.create_task(alert_loop())
+
+        try:
+            async for raw in ws:
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                msg = json.dumps(event).lower()
+
+                if "subscribenewtoken" in msg:
+                    continue
+
+                if "migration" in msg:
+                    await process_migration(event)
+                    continue
+
+                if any(k in event for k in ("name", "symbol")) and extract_token_key(event):
+                    await process_new_token(ws, event)
+                    continue
+
+                if extract_token_key(event):
+                    await process_trade(event)
+
+        finally:
+            alert_task.cancel()
+            save_wallet_history()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
