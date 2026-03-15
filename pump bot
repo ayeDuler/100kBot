@@ -1,0 +1,767 @@
+import json
+import logging
+import os
+import signal
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, List, Optional
+
+import requests
+import websockets
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
+
+# =========================
+# Configuration
+# =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+PUMPPORTAL_API_KEY = os.getenv("PUMPPORTAL_API_KEY", "")
+LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+DEFAULT_SLIPPAGE = float(os.getenv("DEFAULT_SLIPPAGE", "10"))
+DEFAULT_PRIORITY_FEE = float(os.getenv("DEFAULT_PRIORITY_FEE", "0.00005"))
+DEFAULT_BUY_SOL = float(os.getenv("DEFAULT_BUY_SOL", "0.01"))
+WS_URL = os.getenv("PUMPPORTAL_WS_URL", "wss://pumpportal.fun/api/data")
+TRADE_URL = os.getenv("PUMPPORTAL_TRADE_URL", f"https://pumpportal.fun/api/trade?api-key={PUMPPORTAL_API_KEY}")
+LOCAL_TRADE_URL = os.getenv("PUMPPORTAL_LOCAL_TRADE_URL", "https://pumpportal.fun/api/trade-local")
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("pumpfun_bot")
+
+# =========================
+# In-memory state (starter only)
+# =========================
+@dataclass
+class Position:
+    mint: str
+    qty: float = 0.0
+    avg_entry_sol: float = 0.0
+    last_price_sol: float = 0.0
+    pnl_pct: float = 0.0
+    opened_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class TokenState:
+    mint: str
+    symbol: str = "?"
+    name: str = "Unknown"
+    created_at: float = field(default_factory=time.time)
+    last_price_sol: float = 0.0
+    market_cap: float = 0.0
+    buy_count: int = 0
+    sell_count: int = 0
+    trade_count: int = 0
+    unique_wallets: set = field(default_factory=set)
+    recent_trades: Deque[dict] = field(default_factory=lambda: deque(maxlen=200))
+    wallet_buy_volume: Dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    wallet_sell_volume: Dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    score: float = 0.0
+    risk_score: float = 100.0
+    notes: List[str] = field(default_factory=list)
+
+
+class BotState:
+    def __init__(self) -> None:
+        self.watchlist: Dict[str, TokenState] = {}
+        self.positions: Dict[str, Position] = {}
+        self.paper_cash_sol: float = 5.0
+        self.realized_pnl_sol: float = 0.0
+        self.trade_history: List[dict] = []
+        self.tracked_wallet_dump_count: Dict[str, int] = defaultdict(int)
+        self.paused: bool = False
+        self.auto_buy_enabled: bool = False
+        self.auto_sell_enabled: bool = True
+        self.max_positions: int = 3
+        self.min_score_to_buy: float = 65.0
+        self.max_risk_to_buy: float = 40.0
+        self.take_profit_pct: float = 25.0
+        self.stop_loss_pct: float = 15.0
+        self.trailing_stop_pct: float = 12.0
+        self.risk_mode: str = "balanced"
+        self.whitelist: set = set()
+        self.blacklist: set = set()
+        self.open_orders: List[dict] = []
+        self.ws_task: Optional[asyncio.Task] = None
+
+
+STATE = BotState()
+
+# =========================
+# Helpers
+# =========================
+def is_live() -> bool:
+    return LIVE_TRADING and bool(PUMPPORTAL_API_KEY)
+
+
+def format_token(ts: TokenState) -> str:
+    return (
+        f"*{ts.symbol}* â `{ts.mint}`\n"
+        f"Score: *{ts.score:.1f}* | Risk: *{ts.risk_score:.1f}*\n"
+        f"Buys/Sells: *{ts.buy_count}/{ts.sell_count}* | Wallets: *{len(ts.unique_wallets)}*\n"
+        f"Price(SOL): *{ts.last_price_sol:.8f}*\n"
+        f"Notes: {'; '.join(ts.notes[-3:]) if ts.notes else 'None'}"
+    )
+
+
+def compute_risk_and_score(ts: TokenState, state: BotState) -> None:
+    """Heuristic starter model.
+    This does NOT replace on-chain holder analysis and contract auditing.
+    """
+    buys = ts.buy_count
+    sells = ts.sell_count
+    trades = max(1, ts.trade_count)
+    unique_wallets = max(1, len(ts.unique_wallets))
+
+    buy_pressure = min(30.0, (buys / trades) * 30.0)
+    wallet_diversity = min(20.0, unique_wallets * 1.2)
+    activity_bonus = min(15.0, trades * 0.25)
+
+    # Wallet concentration penalty (starter approximation using observed buy flow)
+    total_buy = sum(ts.wallet_buy_volume.values()) or 1.0
+    top_wallet_share = max(ts.wallet_buy_volume.values(), default=0.0) / total_buy
+    concentration_penalty = min(30.0, top_wallet_share * 50.0)
+
+    # Instant dump penalty: wallets that buy then quickly sell heavy size in observed stream
+    early_dump_penalty = 0.0
+    for wallet, sells_vol in ts.wallet_sell_volume.items():
+        buys_vol = ts.wallet_buy_volume.get(wallet, 0.0)
+        if buys_vol > 0 and sells_vol >= buys_vol * 0.75:
+            early_dump_penalty += 3.0
+            state.tracked_wallet_dump_count[wallet] += 1
+            if state.tracked_wallet_dump_count[wallet] >= 3:
+                early_dump_penalty += 4.0
+    early_dump_penalty = min(25.0, early_dump_penalty)
+
+    sell_pressure_penalty = min(25.0, (sells / trades) * 25.0)
+
+    raw_score = 20.0 + buy_pressure + wallet_diversity + activity_bonus
+    risk = 15.0 + concentration_penalty + early_dump_penalty + sell_pressure_penalty
+    score = max(0.0, min(100.0, raw_score - (risk * 0.35)))
+    risk = max(0.0, min(100.0, risk))
+
+    notes = []
+    if top_wallet_share > 0.35:
+        notes.append("High buy concentration")
+    if early_dump_penalty > 6:
+        notes.append("Observed instant-dump wallets")
+    if unique_wallets >= 10:
+        notes.append("Healthy wallet spread")
+    if buys > sells * 2 and buys >= 6:
+        notes.append("Positive buy pressure")
+
+    ts.score = score
+    ts.risk_score = risk
+    ts.notes = notes
+
+
+def should_auto_buy(ts: TokenState, state: BotState) -> bool:
+    if not state.auto_buy_enabled or state.paused:
+        return False
+    if ts.mint in state.blacklist:
+        return False
+    if len(state.positions) >= state.max_positions:
+        return False
+    if ts.mint in state.positions:
+        return False
+    return ts.score >= state.min_score_to_buy and ts.risk_score <= state.max_risk_to_buy
+
+
+def should_auto_sell(pos: Position, state: BotState) -> Optional[str]:
+    if not state.auto_sell_enabled:
+        return None
+    if pos.pnl_pct >= state.take_profit_pct:
+        return "take_profit"
+    if pos.pnl_pct <= -state.stop_loss_pct:
+        return "stop_loss"
+    return None
+
+
+def execute_trade(action: str, mint: str, amount: str | float, denominated_in_sol: bool = True,
+                  slippage: Optional[float] = None, priority_fee: Optional[float] = None,
+                  pool: str = "auto") -> dict:
+    slippage = slippage or DEFAULT_SLIPPAGE
+    priority_fee = priority_fee or DEFAULT_PRIORITY_FEE
+
+    payload = {
+        "action": action,
+        "mint": mint,
+        "amount": amount,
+        "denominatedInSol": str(denominated_in_sol).lower(),
+        "slippage": slippage,
+        "priorityFee": priority_fee,
+        "pool": pool,
+    }
+
+    if not is_live():
+        return {"mode": "paper", "ok": True, "payload": payload, "signature": None}
+
+    resp = requests.post(TRADE_URL, json=payload, timeout=20)
+    data = resp.json()
+    return {"mode": "live", "ok": resp.ok and "errors" not in data, "response": data, "payload": payload}
+
+
+def apply_paper_fill(action: str, mint: str, qty_or_sol: float, price_sol: float) -> dict:
+    if action == "buy":
+        sol_spent = qty_or_sol
+        qty = (sol_spent / price_sol) if price_sol > 0 else 0.0
+        if STATE.paper_cash_sol < sol_spent:
+            return {"ok": False, "error": "Not enough paper SOL balance"}
+        pos = STATE.positions.get(mint)
+        if pos:
+            total_cost = pos.avg_entry_sol * pos.qty + sol_spent
+            pos.qty += qty
+            pos.avg_entry_sol = total_cost / max(pos.qty, 1e-9)
+            pos.last_price_sol = price_sol
+        else:
+            STATE.positions[mint] = Position(mint=mint, qty=qty, avg_entry_sol=price_sol, last_price_sol=price_sol)
+        STATE.paper_cash_sol -= sol_spent
+        STATE.trade_history.append({"ts": time.time(), "action": action, "mint": mint, "sol": sol_spent, "qty": qty, "price": price_sol})
+        return {"ok": True, "qty": qty, "price": price_sol}
+
+    if action == "sell":
+        pos = STATE.positions.get(mint)
+        if not pos:
+            return {"ok": False, "error": "No open position"}
+        pct = float(str(qty_or_sol).replace("%", "")) if isinstance(qty_or_sol, str) and "%" in qty_or_sol else None
+        qty = pos.qty * (pct / 100.0) if pct is not None else float(qty_or_sol)
+        qty = min(qty, pos.qty)
+        sol_received = qty * price_sol
+        pnl_sol = qty * (price_sol - pos.avg_entry_sol)
+        STATE.realized_pnl_sol += pnl_sol
+        pos.qty -= qty
+        pos.last_price_sol = price_sol
+        if pos.qty <= 1e-9:
+            del STATE.positions[mint]
+        STATE.paper_cash_sol += sol_received
+        STATE.trade_history.append({"ts": time.time(), "action": action, "mint": mint, "sol": sol_received, "qty": qty, "price": price_sol, "pnl_sol": pnl_sol})
+        return {"ok": True, "qty": qty, "price": price_sol, "pnl_sol": pnl_sol}
+
+    return {"ok": False, "error": "Unsupported action"}
+
+
+async def maybe_trade(ts: TokenState, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> None:
+    if should_auto_buy(ts, STATE):
+        result = execute_trade("buy", ts.mint, DEFAULT_BUY_SOL, denominated_in_sol=True)
+        fill = apply_paper_fill("buy", ts.mint, DEFAULT_BUY_SOL, ts.last_price_sol or 0.0000001)
+        logger.info("AUTO BUY %s | %s | %s", ts.mint, result, fill)
+
+    pos = STATE.positions.get(ts.mint)
+    if pos and pos.avg_entry_sol > 0:
+        pos.last_price_sol = ts.last_price_sol or pos.last_price_sol
+        pos.pnl_pct = ((pos.last_price_sol - pos.avg_entry_sol) / pos.avg_entry_sol) * 100.0
+        sell_reason = should_auto_sell(pos, STATE)
+        if sell_reason:
+            result = execute_trade("sell", ts.mint, "100%", denominated_in_sol=False)
+            fill = apply_paper_fill("sell", ts.mint, "100%", ts.last_price_sol or pos.last_price_sol)
+            logger.info("AUTO SELL %s | %s | %s | %s", ts.mint, sell_reason, result, fill)
+
+
+# =========================
+# Websocket listener
+# =========================
+async def stream_pump_data() -> None:
+    while True:
+        try:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                logger.info("Subscribed to new token stream")
+                async for raw in ws:
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    mint = data.get("mint") or data.get("ca") or data.get("tokenAddress")
+                    if not mint:
+                        continue
+
+                    ts = STATE.watchlist.get(mint)
+                    if not ts:
+                        ts = TokenState(
+                            mint=mint,
+                            symbol=data.get("symbol", "?"),
+                            name=data.get("name", "Unknown"),
+                        )
+                        STATE.watchlist[mint] = ts
+
+                    tx_type = (data.get("txType") or data.get("tradeType") or data.get("action") or "").lower()
+                    wallet = data.get("traderPublicKey") or data.get("wallet") or data.get("user") or "unknown"
+                    amount_sol = float(data.get("solAmount") or data.get("amountSol") or 0.0)
+                    price_sol = float(data.get("priceSol") or data.get("price") or 0.0)
+                    market_cap = float(data.get("marketCapSol") or data.get("marketCap") or 0.0)
+
+                    ts.trade_count += 1
+                    ts.last_price_sol = price_sol or ts.last_price_sol
+                    ts.market_cap = market_cap or ts.market_cap
+                    ts.unique_wallets.add(wallet)
+                    ts.recent_trades.append(data)
+
+                    if tx_type == "buy":
+                        ts.buy_count += 1
+                        ts.wallet_buy_volume[wallet] += amount_sol
+                    elif tx_type == "sell":
+                        ts.sell_count += 1
+                        ts.wallet_sell_volume[wallet] += amount_sol
+
+                    compute_risk_and_score(ts, STATE)
+                    await maybe_trade(ts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("Stream error: %s", e)
+            await asyncio.sleep(3)
+
+
+# =========================
+# Telegram command handlers
+# =========================
+async def send_text(update: Update, text: str) -> None:
+    if update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [InlineKeyboardButton("Scan", callback_data="scan"), InlineKeyboardButton("Watchlist", callback_data="watchlist")],
+        [InlineKeyboardButton("Portfolio", callback_data="portfolio"), InlineKeyboardButton("Settings", callback_data="settings")],
+        [InlineKeyboardButton("Paper On", callback_data="paper"), InlineKeyboardButton("Pause", callback_data="pause")],
+    ]
+    text = (
+        "*Pump.fun Telegram Trading Bot*\n"
+        f"Mode: *{'LIVE' if is_live() else 'PAPER'}*\n"
+        f"Auto-buy: *{'ON' if STATE.auto_buy_enabled else 'OFF'}*\n"
+        f"Auto-sell: *{'ON' if STATE.auto_sell_enabled else 'OFF'}*\n"
+        f"Tracked tokens: *{len(STATE.watchlist)}* | Positions: *{len(STATE.positions)}*"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(update, "Use /menu, /scan, /watchlist, /portfolio, /autobuy_on, /autosell_on, /pause, /resume, /settings")
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start(update, context)
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(
+        update,
+        f"Mode: *{'LIVE' if is_live() else 'PAPER'}*\n"
+        f"Paused: *{STATE.paused}*\n"
+        f"Auto-buy: *{STATE.auto_buy_enabled}*\n"
+        f"Auto-sell: *{STATE.auto_sell_enabled}*\n"
+        f"Paper SOL: *{STATE.paper_cash_sol:.4f}*\n"
+        f"Realized PnL: *{STATE.realized_pnl_sol:.4f} SOL*",
+    )
+
+
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    best = sorted(STATE.watchlist.values(), key=lambda x: (x.score, -x.risk_score), reverse=True)[:10]
+    if not best:
+        await send_text(update, "No tokens tracked yet. Wait for websocket data.")
+        return
+    lines = [format_token(t) for t in best]
+    await send_text(update, "\n\n".join(lines))
+
+
+async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await scan(update, context)
+
+
+async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tokens = list(STATE.watchlist.values())[:10]
+    if not tokens:
+        await send_text(update, "Watchlist is empty.")
+        return
+    await send_text(update, "\n\n".join(format_token(t) for t in tokens))
+
+
+async def top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await scan(update, context)
+
+
+async def hot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await scan(update, context)
+
+
+async def portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not STATE.positions:
+        await send_text(update, f"No open positions. Paper SOL: *{STATE.paper_cash_sol:.4f}*")
+        return
+    lines = []
+    for pos in STATE.positions.values():
+        lines.append(
+            f"`{pos.mint}`\nQty: *{pos.qty:.4f}* | Entry: *{pos.avg_entry_sol:.8f}* | Last: *{pos.last_price_sol:.8f}* | PnL: *{pos.pnl_pct:.2f}%*"
+        )
+    await send_text(update, "\n\n".join(lines))
+
+
+async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(update, f"Realized PnL: *{STATE.realized_pnl_sol:.4f} SOL*\nPaper SOL: *{STATE.paper_cash_sol:.4f}*")
+
+
+async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await portfolio(update, context)
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not STATE.trade_history:
+        await send_text(update, "No trade history yet.")
+        return
+    lines = []
+    for h in STATE.trade_history[-15:]:
+        lines.append(f"{time.strftime('%H:%M:%S', time.localtime(h['ts']))} | *{h['action'].upper()}* | `{h['mint']}` | price {h['price']:.8f}")
+    await send_text(update, "\n".join(lines))
+
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(update, f"Paper balance: *{STATE.paper_cash_sol:.4f} SOL*")
+
+
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(
+        update,
+        f"Min score: *{STATE.min_score_to_buy}*\n"
+        f"Max risk: *{STATE.max_risk_to_buy}*\n"
+        f"TP: *{STATE.take_profit_pct}%* | SL: *{STATE.stop_loss_pct}%*\n"
+        f"Max positions: *{STATE.max_positions}* | Risk mode: *{STATE.risk_mode}*",
+    )
+
+
+async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await settings(update, context)
+
+
+async def tp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        STATE.take_profit_pct = float(context.args[0])
+    await send_text(update, f"Take profit set to *{STATE.take_profit_pct}%*")
+
+
+async def sl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        STATE.stop_loss_pct = float(context.args[0])
+    await send_text(update, f"Stop loss set to *{STATE.stop_loss_pct}%*")
+
+
+async def trailing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        STATE.trailing_stop_pct = float(context.args[0])
+    await send_text(update, f"Trailing stop set to *{STATE.trailing_stop_pct}%*")
+
+
+async def maxpos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        STATE.max_positions = int(context.args[0])
+    await send_text(update, f"Max positions set to *{STATE.max_positions}*")
+
+
+async def minscore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        STATE.min_score_to_buy = float(context.args[0])
+    await send_text(update, f"Min score set to *{STATE.min_score_to_buy}*")
+
+
+async def maxrisk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        STATE.max_risk_to_buy = float(context.args[0])
+    await send_text(update, f"Max risk set to *{STATE.max_risk_to_buy}*")
+
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 2:
+        await send_text(update, "Usage: /buy <mint> <sol_amount>")
+        return
+    mint, sol_amount = context.args[0], float(context.args[1])
+    price = STATE.watchlist.get(mint, TokenState(mint=mint)).last_price_sol or 0.0000001
+    result = execute_trade("buy", mint, sol_amount, denominated_in_sol=True)
+    fill = apply_paper_fill("buy", mint, sol_amount, price)
+    await send_text(update, f"Buy result: `{json.dumps({'trade': result, 'fill': fill}, default=str)[:3500]}`")
+
+
+async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 1:
+        await send_text(update, "Usage: /sell <mint> [100%]")
+        return
+    mint = context.args[0]
+    amount = context.args[1] if len(context.args) > 1 else "100%"
+    price = STATE.watchlist.get(mint, TokenState(mint=mint)).last_price_sol or 0.0000001
+    result = execute_trade("sell", mint, amount, denominated_in_sol=False)
+    fill = apply_paper_fill("sell", mint, amount, price)
+    await send_text(update, f"Sell result: `{json.dumps({'trade': result, 'fill': fill}, default=str)[:3500]}`")
+
+
+async def autobuy_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE.auto_buy_enabled = True
+    await send_text(update, "Auto-buy *enabled*")
+
+
+async def autobuy_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE.auto_buy_enabled = False
+    await send_text(update, "Auto-buy *disabled*")
+
+
+async def autosell_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE.auto_sell_enabled = True
+    await send_text(update, "Auto-sell *enabled*")
+
+
+async def autosell_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE.auto_sell_enabled = False
+    await send_text(update, "Auto-sell *disabled*")
+
+
+async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE.paused = True
+    await send_text(update, "Bot paused")
+
+
+async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE.paused = False
+    await send_text(update, "Bot resumed")
+
+
+async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LIVE_TRADING
+    LIVE_TRADING = False
+    await send_text(update, "Paper mode active")
+
+
+async def live(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(update, f"Live mode can only be enabled via env var `LIVE_TRADING=true`. Current: *{is_live()}*")
+
+
+async def whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        STATE.whitelist.add(context.args[0])
+    await send_text(update, f"Whitelist size: *{len(STATE.whitelist)}*")
+
+
+async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        STATE.blacklist.add(context.args[0])
+    await send_text(update, f"Blacklist size: *{len(STATE.blacklist)}*")
+
+
+async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        mint = context.args[0]
+        STATE.watchlist.pop(mint, None)
+        STATE.whitelist.discard(mint)
+        STATE.blacklist.discard(mint)
+        await send_text(update, f"Removed `{mint}` from local lists")
+        return
+    await send_text(update, "Usage: /remove <mint>")
+
+
+async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        mint = context.args[0]
+        STATE.watchlist.setdefault(mint, TokenState(mint=mint))
+        await send_text(update, f"Now watching `{mint}`")
+        return
+    await send_text(update, "Usage: /watch <mint>")
+
+
+async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await remove(update, context)
+
+
+async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(update, "Starter build logs alerts in-process. Add Telegram chat alert routing per user/chat for production.")
+
+
+async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    best = sorted(STATE.watchlist.values(), key=lambda x: x.score, reverse=True)[:1]
+    if not best:
+        await send_text(update, "No signal yet.")
+        return
+    ts = best[0]
+    verdict = "BUY" if should_auto_buy(ts, STATE) else "WATCH"
+    await send_text(update, f"Signal: *{verdict}*\n\n{format_token(ts)}")
+
+
+async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await send_text(update, "Usage: /score <mint>")
+        return
+    mint = context.args[0]
+    ts = STATE.watchlist.get(mint)
+    if not ts:
+        await send_text(update, "Token not tracked.")
+        return
+    await send_text(update, format_token(ts))
+
+
+async def rugcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await send_text(update, "Usage: /rugcheck <mint>")
+        return
+    mint = context.args[0]
+    ts = STATE.watchlist.get(mint)
+    if not ts:
+        await send_text(update, "Token not tracked yet. Add /watch first.")
+        return
+    await send_text(update, f"Rug risk for `{mint}`: *{ts.risk_score:.1f}*\nNotes: {'; '.join(ts.notes) or 'None'}")
+
+
+async def dumps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    worst = sorted(STATE.tracked_wallet_dump_count.items(), key=lambda x: x[1], reverse=True)[:10]
+    if not worst:
+        await send_text(update, "No dump wallets observed yet.")
+        return
+    await send_text(update, "\n".join(f"`{w}` â *{c}* early dumps" for w, c in worst))
+
+
+async def exposure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    exposure_sol = sum(p.qty * p.last_price_sol for p in STATE.positions.values())
+    await send_text(update, f"Approx exposure: *{exposure_sol:.4f} SOL*")
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(update, f"Tracked tokens: *{len(STATE.watchlist)}*\nTrades seen: *{sum(t.trade_count for t in STATE.watchlist.values())}*")
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE.watchlist.clear()
+    STATE.positions.clear()
+    STATE.trade_history.clear()
+    STATE.tracked_wallet_dump_count.clear()
+    STATE.paper_cash_sol = 5.0
+    STATE.realized_pnl_sol = 0.0
+    await send_text(update, "Local state reset")
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(update, "pong")
+
+
+async def version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_text(update, "Starter build v0.1")
+
+
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    mapping = {
+        "scan": scan,
+        "watchlist": watchlist,
+        "portfolio": portfolio,
+        "settings": settings,
+        "paper": paper,
+        "pause": pause,
+    }
+    handler = mapping.get(query.data)
+    if handler:
+        await handler(update, context)
+
+
+def build_app() -> Application:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    handlers = {
+        "start": start,
+        "help": help_cmd,
+        "menu": menu,
+        "status": status,
+        "scan": scan,
+        "trending": trending,
+        "watchlist": watchlist,
+        "top": top,
+        "hot": hot,
+        "portfolio": portfolio,
+        "pnl": pnl,
+        "positions": positions,
+        "history": history,
+        "balance": balance,
+        "settings": settings,
+        "risk": risk,
+        "tp": tp,
+        "sl": sl,
+        "trailing": trailing,
+        "maxpos": maxpos,
+        "minscore": minscore,
+        "maxrisk": maxrisk,
+        "buy": buy,
+        "sell": sell,
+        "autobuy_on": autobuy_on,
+        "autobuy_off": autobuy_off,
+        "autosell_on": autosell_on,
+        "autosell_off": autosell_off,
+        "pause": pause,
+        "resume": resume,
+        "paper": paper,
+        "live": live,
+        "watch": watch,
+        "unwatch": unwatch,
+        "whitelist": whitelist_cmd,
+        "blacklist": blacklist_cmd,
+        "remove": remove,
+        "alerts": alerts,
+        "signal": signal_cmd,
+        "score": score_cmd,
+        "rugcheck": rugcheck,
+        "dumps": dumps,
+        "exposure": exposure,
+        "stats": stats,
+        "reset": reset,
+        "ping": ping,
+        "version": version,
+    }
+    for name, fn in handlers.items():
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CallbackQueryHandler(callback_router))
+    return app
+
+
+async def main() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+
+    app = build_app()
+    STATE.ws_task = asyncio.create_task(stream_pump_data())
+
+    stop_event = asyncio.Event()
+
+    def _stop(*_: Any) -> None:
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:
+            pass
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    logger.info("Telegram bot started")
+
+    await stop_event.wait()
+
+    if STATE.ws_task:
+        STATE.ws_task.cancel()
+        with contextlib.suppress(Exception):
+            await STATE.ws_task
+
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
+
+
+if __name__ == "__main__":
+    import contextlib
+    asyncio.run(main())
